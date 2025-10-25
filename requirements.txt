@@ -1,0 +1,7 @@
+### 9send/requirements.txt
+Flask==2.3.3
+requests==2.31.0
+twilio==8.10.0
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+gunicorn==21.2.0

@@ -1,17 +1,18 @@
 # app.py
-from flask import Flask, request
+from flask import Flask, request, abort
 from twilio.twiml.messaging_response import MessagingResponse
-from moonpay import create_payment_link, convert_to_usdc, payout_to_ghana
+from moonpay import create_payment_link, convert_to_usdc, payout_to_ghana, verify_webhook_signature
 from database import get_session, save_session
 import os
 
 app = Flask(__name__)
 
+# === ROOT HEALTH CHECK ===
 @app.route("/")
 def home():
     return "9SEND WhatsApp Bot is LIVE! Send a message to +1 415 523 8886", 200
 
-# Mock data
+# === MOCK DATA ===
 GHANA_BANKS = {
     "1": {"name": "Access Bank", "code": "GH044"},
     "2": {"name": "MTN MoMo", "code": "GH001"}
@@ -23,6 +24,7 @@ POOL_ACCOUNT = {
     "name": "9SEND POOL"
 }
 
+# === MOONPAY WEBHOOK ===
 @app.route("/moonpay-webhook", methods=["POST"])
 def moonpay_webhook():
     signature = request.headers.get("Moonpay-Signature")
@@ -30,19 +32,16 @@ def moonpay_webhook():
         abort(400)
 
     data = request.json
-    event_type = data.get("type")
-
-    if event_type == "payment.succeeded":
+    if data.get("type") == "payment.succeeded":
         tx_id = data["data"]["external_transaction_id"]
-        # Find session by tx_id → trigger payout
-        # (Future: use DB query)
+        # Future: Find session in DB by tx_id and trigger payout
         pass
-
     return "", 200
 
+# === WHATSAPP WEBHOOK ===
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    incoming_msg = request.values.get("Body", "").strip()
+    incoming_msg = request.values.get("Body", "").strip().lower()
     from_number = request.values.get("From").replace("whatsapp:", "")
     resp = MessagingResponse()
     msg = resp.message()
@@ -51,39 +50,35 @@ def whatsapp_webhook():
     step = session["step"]
     data = session["data"]
 
-    # === WELCOME MENU ===
+    # === WELCOME ===
     if step == "welcome":
         save_session(from_number, "main_menu")
-        msg.body(
-            "Welcome to *9SEND* – Send money to Ghana in seconds!\n\n"
-            "Choose an option:\n"
-            "[1] Send Money\n"
-            "[2] Check Rates\n"
-            "[Reply with number]"
-        )
+        msg.body("Welcome to *9SEND* – Send money to Ghana in seconds!")
+        msg.button("Send Money", "send")
+        msg.button("Check Rates", "rates")
 
     # === MAIN MENU ===
     elif step == "main_menu":
-        if incoming_msg == "1":
+        if incoming_msg == "send":
             save_session(from_number, "select_country")
-            msg.body(
-                "Select destination:\n"
-                "[1] Ghana (GHS)\n"
-                "[Reply 1]"
-            )
-        elif incoming_msg == "2":
-            msg.body("Current Rate: 1 NGN ≈ 0.065 GHS\nReply anything to go back.")
-            save_session(from_number, "welcome")
+            msg.body("Select destination:")
+            msg.button("Ghana (GHS)", "ghana")
+        elif incoming_msg == "rates":
+            msg.body("Current Rate: 1 NGN ≈ 0.065 GHS")
+            msg.button("Back", "back")
         else:
-            msg.body("Please reply *1* or *2*")
+            msg.body("Please tap a button.")
+            msg.button("Send Money", "send")
+            msg.button("Check Rates", "rates")
 
     # === SELECT COUNTRY ===
     elif step == "select_country":
-        if incoming_msg == "1":
+        if incoming_msg == "ghana":
             save_session(from_number, "enter_amount")
-            msg.body("Enter amount to send in NGN:\n(e.g., 5000)")
+            msg.body("Enter amount in NGN:\n(e.g., 5000)")
         else:
-            msg.body("Please reply *1* for Ghana")
+            msg.body("Please tap the button.")
+            msg.button("Ghana (GHS)", "ghana")
 
     # === ENTER AMOUNT ===
     elif step == "enter_amount":
@@ -108,15 +103,26 @@ def whatsapp_webhook():
                 f"Receiver gets: *₵{ghs} GHS*\n"
                 f"Fee: *₦{fee} (1%)*\n"
                 f"*Total: ₦{total}*\n\n"
-                f"Reply *Confirm* to continue"
+                "Confirm to continue?"
             )
+            msg.button("Confirm", "confirm")
+            msg.button("Cancel", "cancel")
         except:
             msg.body("Invalid amount. Enter numbers only (e.g., 5000):")
 
     # === CONFIRM AMOUNT ===
-    elif step == "confirm_amount" and incoming_msg.lower() == "confirm":
-        save_session(from_number, "enter_account")
-        msg.body("Enter receiver's account number:\n(e.g., 0690000034)")
+    elif step == "confirm_amount":
+        if incoming_msg == "confirm":
+            save_session(from_number, "enter_account")
+            msg.body("Enter receiver's account number:\n(e.g., 0690000034)")
+        elif incoming_msg == "cancel":
+            save_session(from_number, "welcome")
+            msg.body("Cancelled. Start over?")
+            msg.button("Send Money", "send")
+        else:
+            msg.body("Please tap Confirm or Cancel.")
+            msg.button("Confirm", "confirm")
+            msg.button("Cancel", "cancel")
 
     # === ENTER ACCOUNT ===
     elif step == "enter_account":
@@ -125,8 +131,9 @@ def whatsapp_webhook():
             msg.body("Invalid account. Try again:")
             return str(resp)
         save_session(from_number, "select_bank", {"account": account})
-        banks_list = "\n".join([f"[{k}] {v['name']}" for k, v in GHANA_BANKS.items()])
-        msg.body(f"Select bank for {account}:\n{banks_list}\n[Reply 1 or 2]")
+        msg.body(f"Select bank for {account}:")
+        msg.button("Access Bank", "1")
+        msg.button("MTN MoMo", "2")
 
     # === SELECT BANK ===
     elif step == "select_bank":
@@ -139,51 +146,73 @@ def whatsapp_webhook():
             msg.body(
                 f"Account Name: *JOHN DOE*\n"
                 f"Bank: {bank['name']}\n\n"
-                f"Reply *Yes* to proceed"
+                "Proceed?"
             )
+            msg.button("Yes", "yes")
+            msg.button("No", "no")
         else:
-            msg.body("Invalid selection. Reply *1* or *2*")
+            msg.body("Invalid. Tap a bank:")
+            msg.button("Access Bank", "1")
+            msg.button("MTN MoMo", "2")
 
     # === SHOW NAME & POOL ===
-    elif step == "show_name" and incoming_msg.lower() == "yes":
-        total = data["total"]
-        ref = f"9SEND-{from_number[-4:]}"
-        save_session(from_number, "awaiting_payment", {"ref": ref})
+    elif step == "show_name":
+        if incoming_msg == "yes":
+            total = data["total"]
+            ref = f"9SEND-{from_number[-4:]}"
+            save_session(from_number, "awaiting_payment", {"ref": ref})
 
-        msg.body(
-            f"Pay *₦{total}* to:\n"
-            f"Bank: *{POOL_ACCOUNT['bank']}*\n"
-            f"Account: *{POOL_ACCOUNT['account']}*\n"
-            f"Name: *{POOL_ACCOUNT['name']}*\n"
-            f"Ref: *{ref}*\n\n"
-            f"After payment, reply *paid*"
-        )
+            msg.body(
+                f"Pay *₦{total}* to:\n"
+                f"Bank: *{POOL_ACCOUNT['bank']}*\n"
+                f"Account: *{POOL_ACCOUNT['account']}*\n"
+                f"Name: *{POOL_ACCOUNT['name']}*\n"
+                f"Ref: *{ref}*\n\n"
+                "After payment, tap 'I Paid'"
+            )
+            msg.button("I Paid", "paid")
+        elif incoming_msg == "no":
+            save_session(from_number, "welcome")
+            msg.body("Cancelled. Start over?")
+            msg.button("Send Money", "send")
+        else:
+            msg.body("Please tap Yes or No.")
+            msg.button("Yes", "yes")
+            msg.button("No", "no")
 
-    # === PAID → PAYOUT ===
-    elif step == "awaiting_payment" and incoming_msg.lower() == "paid":
-        usdc = convert_to_usdc(data["amount_ngn"])
-        payout = payout_to_ghana(
-            usdc_amount=usdc,
-            account_number=data["account"],
-            bank_code=data["bank_code"]
-        )
+    # === AWAITING PAYMENT ===
+    elif step == "awaiting_payment":
+        if incoming_msg == "paid":
+            usdc = convert_to_usdc(data["amount_ngn"])
+            payout = payout_to_ghana(
+                usdc_amount=usdc,
+                account_number=data["account"],
+                bank_code=data["bank_code"]
+            )
 
-        save_session(from_number, "welcome")  # Reset
+            save_session(from_number, "welcome")
 
-        msg.body(
-            f"Success!\n"
-            f"₦{data['amount_ngn']} → {usdc} USDC → {payout['amount_ghs']} GHS\n"
-            f"Sent to *JOHN DOE* ({data['bank_name']})\n"
-            f"Ref: {payout['tx_id']}\n"
-            f"Delivered in 8 seconds!"
-        )
+            msg.body(
+                f"Success!\n"
+                f"₦{data['amount_ngn']} → {usdc} USDC → {payout['amount_ghs']} GHS\n"
+                f"Sent to *JOHN DOE* ({data['bank_name']})\n"
+                f"Ref: {payout['tx_id']}\n"
+                f"Delivered in 8 seconds!"
+            )
+            msg.button("Send Again", "send")
+        else:
+            msg.body("Tap 'I Paid' when done.")
+            msg.button("I Paid", "paid")
 
     # === FALLBACK ===
     else:
         save_session(from_number, "welcome")
-        msg.body("Reply anything to start over.")
+        msg.body("Let's start over.")
+        msg.button("Send Money", "send")
+        msg.button("Check Rates", "rates")
 
     return str(resp)
+
 
 if __name__ == "__main__":
     app.run(debug=True)

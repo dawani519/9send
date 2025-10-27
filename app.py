@@ -7,6 +7,10 @@ import os
 
 app = Flask(__name__)
 
+@app.route("/")
+def home():
+    return "9SEND WhatsApp Bot is LIVE! Send a message to +1 415 523 8886", 200
+
 # Mock data
 GHANA_BANKS = {
     "1": {"name": "Access Bank", "code": "GH044"},

@@ -4,6 +4,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+MOONPAY_PUBLIC_KEY = os.getenv('MOONPAY_PUBLIC_KEY')  # pk_test_xxx
+MOONPAY_SECRET_KEY = os.getenv('MOONPAY_SECRET_KEY')  # sk_test_xxx
+MOONPAY_BASE_URL = "https://api.moonpay.io"
+
 # Twilio
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')

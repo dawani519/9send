@@ -1,6 +1,19 @@
 # moonpay.py
 import requests
 from config import MOONPAY_SECRET_KEY, MOONPAY_BASE_URL
+from flask import abort
+import hmac
+import hashlib
+
+def verify_webhook_signature(payload, signature_header):
+    if not MOONPAY_WEBHOOK_KEY:
+        return True  # Skip in sandbox
+    expected = hmac.new(
+        MOONPAY_WEBHOOK_KEY.encode(),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 # Global headers
 HEADERS = {

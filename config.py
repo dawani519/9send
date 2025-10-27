@@ -7,6 +7,7 @@ load_dotenv()
 MOONPAY_PUBLIC_KEY = os.getenv('MOONPAY_PUBLIC_KEY')  # pk_test_xxx
 MOONPAY_SECRET_KEY = os.getenv('MOONPAY_SECRET_KEY')  # sk_test_xxx
 MOONPAY_BASE_URL = "https://api.moonpay.io"
+MOONPAY_WEBHOOK_KEY = os.getenv('MOONPAY_WEBHOOK_KEY')
 
 # Twilio
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')

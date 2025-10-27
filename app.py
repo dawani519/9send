@@ -19,6 +19,23 @@ POOL_ACCOUNT = {
     "name": "9SEND POOL"
 }
 
+@app.route("/moonpay-webhook", methods=["POST"])
+def moonpay_webhook():
+    signature = request.headers.get("Moonpay-Signature")
+    if not verify_webhook_signature(request.data, signature):
+        abort(400)
+
+    data = request.json
+    event_type = data.get("type")
+
+    if event_type == "payment.succeeded":
+        tx_id = data["data"]["external_transaction_id"]
+        # Find session by tx_id → trigger payout
+        # (Future: use DB query)
+        pass
+
+    return "", 200
+
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
     incoming_msg = request.values.get("Body", "").strip()

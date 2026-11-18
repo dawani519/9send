@@ -38,7 +38,6 @@ render.yml
 .env
 .env.local
 .env.*.local
-.env.example
 *.env
 
 # Database
@@ -86,7 +85,6 @@ config.py
 
 # Local Testing
 test/
-tests/
 *.test.py
 .pytest_cache/
 htmlcov/

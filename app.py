@@ -1,189 +1,123 @@
-# app.py
-from flask import Flask, request
+"""9SEND: send money from Nigeria to Ghana over WhatsApp."""
+import logging
+
+from flask import Flask, abort, request
+from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
-from moonpay import create_payment_link, convert_to_usdc, payout_to_ghana
-from database import get_session, save_session
-import os
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-app = Flask(__name__)
+from bot import handle_message
+from config import Config
+from database import Database
+from payments import (
+    ProviderError,
+    ProviderUnavailable,
+    WebhookAuthError,
+    build_providers,
+    get_collector,
+    get_payout,
+    providers_named,
+)
+from transfers import handle_event
 
-@app.route("/")
-def home():
-    return "9SEND WhatsApp Bot is LIVE! Send a message to +1 415 523 8886", 200
+log = logging.getLogger(__name__)
 
-# Mock data
-GHANA_BANKS = {
-    "1": {"name": "Access Bank", "code": "GH044"},
-    "2": {"name": "MTN MoMo", "code": "GH001"}
-}
 
-POOL_ACCOUNT = {
-    "bank": "Zenith Bank",
-    "account": "2214567890",
-    "name": "9SEND POOL"
-}
+def create_app(overrides=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-@app.route("/moonpay-webhook", methods=["POST"])
-def moonpay_webhook():
-    signature = request.headers.get("Moonpay-Signature")
-    if not verify_webhook_signature(request.data, signature):
-        abort(400)
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    if overrides:
+        app.config.update(overrides)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)  # Render terminates TLS in front of us
 
-    data = request.json
-    event_type = data.get("type")
-
-    if event_type == "payment.succeeded":
-        tx_id = data["data"]["external_transaction_id"]
-        # Find session by tx_id → trigger payout
-        # (Future: use DB query)
-        pass
-
-    return "", 200
-
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp_webhook():
-    incoming_msg = request.values.get("Body", "").strip()
-    from_number = request.values.get("From").replace("whatsapp:", "")
-    resp = MessagingResponse()
-    msg = resp.message()
-
-    session = get_session(from_number) or {"step": "welcome", "data": {}}
-    step = session["step"]
-    data = session["data"]
-
-    # === WELCOME MENU ===
-    if step == "welcome":
-        save_session(from_number, "main_menu")
-        msg.body(
-            "Welcome to *9SEND* – Send money to Ghana in seconds!\n\n"
-            "Choose an option:\n"
-            "[1] Send Money\n"
-            "[2] Check Rates\n"
-            "[Reply with number]"
-        )
-
-    # === MAIN MENU ===
-    elif step == "main_menu":
-        if incoming_msg == "1":
-            save_session(from_number, "select_country")
-            msg.body(
-                "Select destination:\n"
-                "[1] Ghana (GHS)\n"
-                "[Reply 1]"
-            )
-        elif incoming_msg == "2":
-            msg.body("Current Rate: 1 NGN ≈ 0.065 GHS\nReply anything to go back.")
-            save_session(from_number, "welcome")
-        else:
-            msg.body("Please reply *1* or *2*")
-
-    # === SELECT COUNTRY ===
-    elif step == "select_country":
-        if incoming_msg == "1":
-            save_session(from_number, "enter_amount")
-            msg.body("Enter amount to send in NGN:\n(e.g., 5000)")
-        else:
-            msg.body("Please reply *1* for Ghana")
-
-    # === ENTER AMOUNT ===
-    elif step == "enter_amount":
-        try:
-            amount = float(incoming_msg)
-            if amount < 100:
-                msg.body("Minimum is ₦100. Try again:")
-                return str(resp)
-            ghs = round(amount * 0.065, 2)
-            fee = round(amount * 0.01, 2)
-            total = amount + fee
-
-            save_session(from_number, "confirm_amount", {
-                "amount_ngn": amount,
-                "amount_ghs": ghs,
-                "fee": fee,
-                "total": total
-            })
-
-            msg.body(
-                f"You send: *₦{amount}*\n"
-                f"Receiver gets: *₵{ghs} GHS*\n"
-                f"Fee: *₦{fee} (1%)*\n"
-                f"*Total: ₦{total}*\n\n"
-                f"Reply *Confirm* to continue"
-            )
-        except:
-            msg.body("Invalid amount. Enter numbers only (e.g., 5000):")
-
-    # === CONFIRM AMOUNT ===
-    elif step == "confirm_amount" and incoming_msg.lower() == "confirm":
-        save_session(from_number, "enter_account")
-        msg.body("Enter receiver's account number:\n(e.g., 0690000034)")
-
-    # === ENTER ACCOUNT ===
-    elif step == "enter_account":
-        account = incoming_msg.strip()
-        if len(account) < 8:
-            msg.body("Invalid account. Try again:")
-            return str(resp)
-        save_session(from_number, "select_bank", {"account": account})
-        banks_list = "\n".join([f"[{k}] {v['name']}" for k, v in GHANA_BANKS.items()])
-        msg.body(f"Select bank for {account}:\n{banks_list}\n[Reply 1 or 2]")
-
-    # === SELECT BANK ===
-    elif step == "select_bank":
-        if incoming_msg in GHANA_BANKS:
-            bank = GHANA_BANKS[incoming_msg]
-            save_session(from_number, "show_name", {
-                "bank_code": bank["code"],
-                "bank_name": bank["name"]
-            })
-            msg.body(
-                f"Account Name: *JOHN DOE*\n"
-                f"Bank: {bank['name']}\n\n"
-                f"Reply *Yes* to proceed"
-            )
-        else:
-            msg.body("Invalid selection. Reply *1* or *2*")
-
-    # === SHOW NAME & POOL ===
-    elif step == "show_name" and incoming_msg.lower() == "yes":
-        total = data["total"]
-        ref = f"9SEND-{from_number[-4:]}"
-        save_session(from_number, "awaiting_payment", {"ref": ref})
-
-        msg.body(
-            f"Pay *₦{total}* to:\n"
-            f"Bank: *{POOL_ACCOUNT['bank']}*\n"
-            f"Account: *{POOL_ACCOUNT['account']}*\n"
-            f"Name: *{POOL_ACCOUNT['name']}*\n"
-            f"Ref: *{ref}*\n\n"
-            f"After payment, reply *paid*"
-        )
-
-    # === PAID → PAYOUT ===
-    elif step == "awaiting_payment" and incoming_msg.lower() == "paid":
-        usdc = convert_to_usdc(data["amount_ngn"])
-        payout = payout_to_ghana(
-            usdc_amount=usdc,
-            account_number=data["account"],
-            bank_code=data["bank_code"]
-        )
-
-        save_session(from_number, "welcome")  # Reset
-
-        msg.body(
-            f"Success!\n"
-            f"₦{data['amount_ngn']} → {usdc} USDC → {payout['amount_ghs']} GHS\n"
-            f"Sent to *JOHN DOE* ({data['bank_name']})\n"
-            f"Ref: {payout['tx_id']}\n"
-            f"Delivered in 8 seconds!"
-        )
-
-    # === FALLBACK ===
+    app.extensions["db"] = Database(app.config["DATABASE_URL"])
+    collector, payout = build_providers(app.config)
+    app.extensions["collector"], app.extensions["payout"] = collector, payout
+    if payout.is_sandbox:
+        log.warning("Running with the SANDBOX payment provider: no real money moves.")
     else:
-        save_session(from_number, "welcome")
-        msg.body("Reply anything to start over.")
+        log.info("Collecting naira with %s, paying out cedis with %s", collector.name, payout.name)
 
-    return str(resp)
+    @app.get("/")
+    def home():
+        return "9SEND WhatsApp bot is live.", 200
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "collection": get_collector().name, "payout": get_payout().name}, 200
+
+    @app.post("/whatsapp")
+    def whatsapp_webhook():
+        if not _twilio_request_is_valid(app):
+            abort(403)
+        sender = request.values.get("From", "")
+        if not sender:
+            abort(400)
+        phone = sender.replace("whatsapp:", "")
+        try:
+            reply = handle_message(phone, request.values.get("Body", ""))
+        except Exception:
+            log.exception("Error handling message from %s", phone)
+            reply = "Sorry, something went wrong on our side. Please try again, or send *menu* to start over."
+        resp = MessagingResponse()
+        resp.message(reply)
+        return str(resp), 200, {"Content-Type": "application/xml"}
+
+    @app.post("/webhooks/<provider_name>")
+    def payments_webhook(provider_name):
+        candidates = providers_named(provider_name)
+        if not candidates:
+            abort(404)
+        body = request.get_data()
+        for provider in candidates:  # Paystack can have two (Nigerian and Ghanaian businesses)
+            try:
+                event = provider.parse_webhook(request.headers, body)
+            except WebhookAuthError:
+                continue
+            except ProviderUnavailable:
+                # Couldn't re-verify with the provider; a non-2xx makes it retry later.
+                log.exception("Could not verify %s webhook with the provider", provider_name)
+                return "", 503
+            except ProviderError:
+                log.exception("%s rejected webhook verification", provider_name)
+                return "", 200
+            if event is not None:
+                handle_event(event)
+            return "", 200
+        abort(401)
+
+    return app
+
+
+def _twilio_request_is_valid(app):
+    cfg = app.config
+    if not cfg["VALIDATE_TWILIO_SIGNATURE"]:
+        return True
+    if cfg["PUBLIC_BASE_URL"]:
+        url = cfg["PUBLIC_BASE_URL"] + request.path
+        if request.query_string:
+            url += "?" + request.query_string.decode()
+    else:
+        url = request.url
+    validator = RequestValidator(cfg["TWILIO_AUTH_TOKEN"] or "")
+    return validator.validate(url, request.form, request.headers.get("X-Twilio-Signature", ""))
+
+
+_app = None
+
+
+def __getattr__(name):
+    """Build the app on first access, so `gunicorn app:app` works without
+    importing this module (e.g. in tests) creating a database connection."""
+    global _app
+    if name == "app":
+        if _app is None:
+            _app = create_app()
+        return _app
+    raise AttributeError(name)
+
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    create_app().run(debug=True)

@@ -1,48 +1,94 @@
-# database.py
-import os
-from sqlalchemy import create_engine, Column, String, JSON, DateTime, func
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+"""Database models and connection."""
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional
 
-# Connect to Render PostgreSQL (DATABASE_URL from env)
-engine = create_engine(os.getenv('DATABASE_URL'), pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+from flask import current_app
+from sqlalchemy import JSON, DateTime, Numeric, String, create_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value):
+    """SQLite returns naive datetimes; treat them as UTC."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+class Base(DeclarativeBase):
+    pass
+
 
 class UserSession(Base):
+    """Where each WhatsApp user is in the conversation."""
+
     __tablename__ = "user_sessions"
 
-    phone = Column(String, primary_key=True)  # WhatsApp number
-    step = Column(String, default="welcome")  # Current bot step
-    data = Column(JSON, default=dict)         # Stores amount, account, etc.
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    phone: Mapped[str] = mapped_column(String(32), primary_key=True)
+    step: Mapped[str] = mapped_column(String(32), default="main_menu")
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
-# Create table if not exists
-Base.metadata.create_all(bind=engine)
 
-# === HELPER FUNCTIONS ===
-def get_session(phone):
-    db = SessionLocal()
-    try:
-        result = db.query(UserSession).filter(UserSession.phone == phone).first()
-        if result:
-            return {"step": result.step, "data": result.data or {}}
-        return {"step": "welcome", "data": {}}
-    finally:
-        db.close()
+class TransferStatus:
+    AWAITING_PAYMENT = "awaiting_payment"  # waiting for the sender's naira
+    PROCESSING = "processing"  # naira confirmed, starting payout
+    PAYOUT_PENDING = "payout_pending"  # payout submitted, waiting for the provider's result
+    COMPLETED = "completed"
+    FAILED = "failed"  # payout rejected; sender needs a refund
+    NEEDS_REVIEW = "needs_review"  # money received but something is off; a human must look
+    CANCELLED = "cancelled"
 
-def save_session(phone, step, data=None):
-    db = SessionLocal()
-    try:
-        session = db.query(UserSession).filter(UserSession.phone == phone).first()
-        if session:
-            session.step = step
-            if data:
-                session.data = {**session.data, **data}
-        else:
-            new_data = data or {}
-            session = UserSession(phone=phone, step=step, data=new_data)
-            db.add(session)
-        db.commit()
-    finally:
-        db.close()
+
+class Transfer(Base):
+    """One money transfer, from quote to payout."""
+
+    __tablename__ = "transfers"
+
+    reference: Mapped[str] = mapped_column(String(16), primary_key=True)
+    phone: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True, default=TransferStatus.AWAITING_PAYMENT)
+
+    amount_ngn: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    fee_ngn: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    total_ngn: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    ngn_per_ghs: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    amount_ghs: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+
+    bank_code: Mapped[str] = mapped_column(String(16))
+    bank_name: Mapped[str] = mapped_column(String(64))
+    account_number: Mapped[str] = mapped_column(String(32))
+    account_name: Mapped[str] = mapped_column(String(128))
+
+    # Where the sender pays: bank details, or a checkout link (pay_url).
+    pay_bank_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pay_account_number: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    pay_account_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    pay_amount_ngn: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    pay_expires: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pay_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # checkout link
+
+    amount_paid_ngn: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    provider_ref: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    failure_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class Database:
+    def __init__(self, url):
+        kwargs = {"pool_pre_ping": True}
+        if url.startswith("sqlite"):
+            kwargs["connect_args"] = {"check_same_thread": False}
+        self.engine = create_engine(url, **kwargs)
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+        Base.metadata.create_all(self.engine)
+
+
+def get_db() -> Database:
+    return current_app.extensions["db"]
